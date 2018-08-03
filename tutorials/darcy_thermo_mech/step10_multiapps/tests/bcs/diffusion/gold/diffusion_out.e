@@ -1,0 +1,1 @@
+../../../../../step09_mechanics/tests/bcs/diffusion/gold/diffusion_out.e

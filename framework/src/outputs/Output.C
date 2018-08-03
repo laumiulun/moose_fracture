@@ -1,0 +1,261 @@
+/****************************************************************/
+/*               DO NOT MODIFY THIS HEADER                      */
+/* MOOSE - Multiphysics Object Oriented Simulation Environment  */
+/*                                                              */
+/*           (c) 2010 Battelle Energy Alliance, LLC             */
+/*                   ALL RIGHTS RESERVED                        */
+/*                                                              */
+/*          Prepared by Battelle Energy Alliance, LLC           */
+/*            Under Contract No. DE-AC07-05ID14517              */
+/*            With the U. S. Department of Energy               */
+/*                                                              */
+/*            See COPYRIGHT for full restrictions               */
+/****************************************************************/
+
+// Standard includes
+#include <math.h>
+
+// MOOSE includes
+#include "Output.h"
+#include "FEProblem.h"
+#include "DisplacedProblem.h"
+#include "MooseApp.h"
+#include "Postprocessor.h"
+#include "Restartable.h"
+#include "FileMesh.h"
+#include "MooseUtils.h"
+#include "MooseApp.h"
+#include "Console.h"
+
+#include "libmesh/equation_systems.h"
+
+template <>
+InputParameters
+validParams<Output>()
+{
+  // Get the parameters from the parent object
+  InputParameters params = validParams<MooseObject>();
+  params += validParams<SetupInterface>();
+
+  // Displaced Mesh options
+  params.addParam<bool>(
+      "use_displaced", false, "Enable/disable the use of the displaced mesh for outputting");
+
+  // Output intervals and timing
+  params.addParam<unsigned int>(
+      "interval", 1, "The interval at which time steps are output to the solution file");
+  params.addParam<std::vector<Real>>("sync_times",
+                                     "Times at which the output and solution is forced to occur");
+  params.addParam<bool>("sync_only", false, "Only export results at sync times");
+  params.addParam<Real>("start_time", "Time at which this output object begins to operate");
+  params.addParam<Real>("end_time", "Time at which this output object stop operating");
+  params.addParam<Real>(
+      "time_tolerance", 1e-14, "Time tolerance utilized checking start and end times");
+
+  // Update the 'execute_on' input parameter for output
+  ExecFlagEnum & exec_enum = params.set<ExecFlagEnum>("execute_on", true);
+  exec_enum = Output::getDefaultExecFlagEnum();
+  exec_enum = {EXEC_INITIAL, EXEC_TIMESTEP_END};
+  params.setDocString("execute_on", exec_enum.getDocString());
+
+  // Add ability to append to the 'execute_on' list
+  params.addParam<ExecFlagEnum>("additional_execute_on", exec_enum, exec_enum.getDocString());
+  params.set<ExecFlagEnum>("additional_execute_on").clear();
+
+  // 'Timing' group
+  params.addParamNamesToGroup("time_tolerance interval sync_times sync_only start_time end_time ",
+                              "Timing");
+
+  // Add a private parameter for indicating if it was created with short-cut syntax
+  params.addPrivateParam<bool>("_built_by_moose", false);
+
+  // Register this class as base class
+  params.declareControllable("enable");
+  params.registerBase("Output");
+
+  return params;
+}
+
+MultiMooseEnum
+Output::getExecuteOptions(std::string default_type)
+{
+  // TODO: ExecFlagType
+  ::mooseDeprecated("This version 'getExecuteOptions' was replaced by the "
+                    "Output::getDefaultExecFlagEnum() static function.");
+  ExecFlagEnum exec_enum = MooseUtils::getDefaultExecFlagEnum();
+  exec_enum.addAvailableFlags(EXEC_FAILED);
+  exec_enum = default_type;
+  return exec_enum;
+}
+
+ExecFlagEnum
+Output::getDefaultExecFlagEnum()
+{
+  ExecFlagEnum exec_enum = MooseUtils::getDefaultExecFlagEnum();
+  exec_enum.addAvailableFlags(EXEC_FAILED);
+  return exec_enum;
+}
+
+Output::Output(const InputParameters & parameters)
+  : MooseObject(parameters),
+    Restartable(parameters, "Output"),
+    MeshChangedInterface(parameters),
+    SetupInterface(this),
+    _problem_ptr(getParam<FEProblemBase *>("_fe_problem_base")),
+    _transient(_problem_ptr->isTransient()),
+    _use_displaced(getParam<bool>("use_displaced")),
+    _es_ptr(_use_displaced ? &_problem_ptr->getDisplacedProblem()->es() : &_problem_ptr->es()),
+    _execute_on(getParam<ExecFlagEnum>("execute_on")),
+    _time(_problem_ptr->time()),
+    _time_old(_problem_ptr->timeOld()),
+    _t_step(_problem_ptr->timeStep()),
+    _dt(_problem_ptr->dt()),
+    _dt_old(_problem_ptr->dtOld()),
+    _num(0),
+    _interval(getParam<unsigned int>("interval")),
+    _sync_times(std::set<Real>(getParam<std::vector<Real>>("sync_times").begin(),
+                               getParam<std::vector<Real>>("sync_times").end())),
+    _start_time(isParamValid("start_time") ? getParam<Real>("start_time")
+                                           : -std::numeric_limits<Real>::max()),
+    _end_time(isParamValid("end_time") ? getParam<Real>("end_time")
+                                       : std::numeric_limits<Real>::max()),
+    _t_tol(getParam<Real>("time_tolerance")),
+    _sync_only(getParam<bool>("sync_only")),
+    _initialized(false),
+    _allow_output(true),
+    _is_advanced(false),
+    _advanced_execute_on(_execute_on, parameters)
+{
+  // Apply the additional output flags
+  if (isParamValid("additional_execute_on"))
+  {
+    const ExecFlagEnum & add = getParam<ExecFlagEnum>("additional_execute_on");
+    for (auto & me : add)
+      _execute_on.push_back(me);
+  }
+}
+
+void
+Output::initialSetup()
+{
+  _initialized = true;
+}
+
+void
+Output::solveSetup()
+{
+}
+
+void
+Output::outputStep(const ExecFlagType & type)
+{
+  // Output is not allowed
+  if (!_allow_output && type != EXEC_FORCED)
+    return;
+
+  // If recovering disable output of initial condition, it was already output
+  if (type == EXEC_INITIAL && _app.isRecovering())
+    return;
+
+  // Return if the current output is not on the desired interval
+  if (type != EXEC_FINAL && !onInterval())
+    return;
+
+  // Call the output method
+  if (shouldOutput(type))
+    output(type);
+}
+
+bool
+Output::shouldOutput(const ExecFlagType & type)
+{
+  // Note that in older versions of MOOSE, this was overloaded (unintentionally) to always return
+  // true for the Console output subclass - basically ignoring execute_on options specified for
+  // the console (e.g. via the input file).
+  if (_execute_on.contains(type) || type == EXEC_FORCED)
+    return true;
+  return false;
+}
+
+bool
+Output::onInterval()
+{
+  // The output flag to return
+  bool output = false;
+
+  // Return true if the current step on the current output interval and within the output time range
+  if (_time >= _start_time && _time <= _end_time && (_t_step % _interval) == 0)
+    output = true;
+
+  // Return false if 'sync_only' is set to true
+  if (_sync_only)
+    output = false;
+
+  // If sync times are not skipped, return true if the current time is a sync_time
+  if (_sync_times.find(_time) != _sync_times.end())
+    output = true;
+
+  // Return the output status
+  return output;
+}
+
+Real
+Output::time()
+{
+  if (_transient)
+    return _time;
+  else
+    return _t_step;
+}
+
+Real
+Output::timeOld()
+{
+  if (_transient)
+    return _time_old;
+  else
+    return _t_step - 1;
+}
+
+Real
+Output::dt()
+{
+  if (_transient)
+    return _dt;
+  else
+    return 1;
+}
+
+Real
+Output::dtOld()
+{
+  if (_transient)
+    return _dt_old;
+  else
+    return 1;
+}
+
+int
+Output::timeStep()
+{
+  return _t_step;
+}
+
+const MultiMooseEnum &
+Output::executeOn() const
+{
+  return _execute_on;
+}
+
+bool
+Output::isAdvanced()
+{
+  return _is_advanced;
+}
+
+const OutputOnWarehouse &
+Output::advancedExecuteOn() const
+{
+  mooseError("The output object ", name(), " is not an AdvancedOutput, use isAdvanced() to check.");
+  return _advanced_execute_on;
+}

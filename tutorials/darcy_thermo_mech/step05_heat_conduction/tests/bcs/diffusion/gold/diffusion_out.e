@@ -1,0 +1,1 @@
+../../../../../step04_velocity_aux/tests/bcs/diffusion/gold/diffusion_out.e

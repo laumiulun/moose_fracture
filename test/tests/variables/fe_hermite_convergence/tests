@@ -1,0 +1,17 @@
+[Tests]
+  [./test_hermite_converge_periodic]
+    type = 'Exodiff'
+    input = 'hermite_converge_periodic.i'
+    exodiff = 'hermite_converge_periodic_out.e-s003'
+    group = 'periodic'
+    valgrind = 'HEAVY'
+  [../]
+
+  [./test_hermite_converge_dirichlet]
+    type = 'Exodiff'
+    input = 'hermite_converge_dirichlet.i'
+    exodiff = 'hermite_converge_dirichlet_out.e-s003'
+    valgrind = 'HEAVY'
+    abs_zero = 1e-09
+  [../]
+[]

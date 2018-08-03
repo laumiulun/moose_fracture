@@ -1,0 +1,1 @@
+../../../../step01_diffusion/tests/bcs/diffusion/diffusion.i

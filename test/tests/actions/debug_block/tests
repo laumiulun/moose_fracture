@@ -1,0 +1,7 @@
+[Tests]
+  [./test_debug_block]
+    type = RunApp
+    input = 'debug_print_actions_test.i'
+    expect_out = '[DBG][ACT]'
+  [../]
+[]

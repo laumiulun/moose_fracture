@@ -1,0 +1,1 @@
+../../../../../step02_darcy_pressure/tests/bcs/diffusion/gold/diffusion_out.e
